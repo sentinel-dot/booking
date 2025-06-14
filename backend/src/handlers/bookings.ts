@@ -131,7 +131,7 @@ export async function handleCreateBooking(req: ExtendedRequest, res: ExtendedRes
           customer_phone, booking_date, start_time, end_time, party_size, 
           special_requests, total_amount, status, created_at, updated_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'pending', NOW(), NOW())
-        RETURNING id, customer_name, booking_date, start_time, end_time, status, total_amount`,
+        RETURNING id, customer_name, TO_CHAR(booking_date, 'YYYY-MM-DD') as booking_date, start_time, end_time, status, total_amount`,
         [
           bookingData.businessId,
           bookingData.serviceId,
@@ -193,78 +193,78 @@ export async function handleCreateBooking(req: ExtendedRequest, res: ExtendedRes
 }
 
 export async function handleGetBookings(req: ExtendedRequest, res: ExtendedResponse): Promise<void> {
-  const { businessId } = req.params!;
-  const { date, status, staffMemberId } = req.query!;
-  
-  if (!businessId || !Number.isInteger(parseInt(businessId))) {
-    res.status(400).json({ error: 'Valid business ID required' });
-    return;
+    const { businessId } = req.params!;
+    const { date, status, staffMemberId } = req.query!;
+    
+    if (!businessId || !Number.isInteger(parseInt(businessId))) {
+      res.status(400).json({ error: 'Valid business ID required' });
+      return;
+    }
+    
+    try {
+      let whereConditions = ['b.business_id = $1'];
+      let queryParams: any[] = [parseInt(businessId)];
+      let paramIndex = 2;
+      
+      if (date) {
+        // FIX: Explizite Date-Vergleich ohne Timezone-Issues
+        whereConditions.push(`b.booking_date::date = $${paramIndex}::date`);
+        queryParams.push(date);
+        paramIndex++;
+      }
+      
+      if (status) {
+        whereConditions.push(`b.status = $${paramIndex}`);
+        queryParams.push(status);
+        paramIndex++;
+      }
+      
+      if (staffMemberId) {
+        whereConditions.push(`b.staff_member_id = $${paramIndex}`);
+        queryParams.push(parseInt(staffMemberId));
+        paramIndex++;
+      }
+      
+      // FIX: Explizite Date-Konvertierung in SELECT
+      const bookingsQuery = `
+        SELECT 
+          b.id, b.customer_name, b.customer_email, 
+          TO_CHAR(b.booking_date, 'YYYY-MM-DD') as booking_date,
+          b.start_time, b.end_time, b.party_size, b.status, b.total_amount,
+          s.name as service_name, s.duration_minutes,
+          sm.name as staff_name
+        FROM bookings b
+        JOIN services s ON b.service_id = s.id
+        LEFT JOIN staff_members sm ON b.staff_member_id = sm.id
+        WHERE ${whereConditions.join(' AND ')}
+        ORDER BY b.booking_date ASC, b.start_time ASC
+      `;
+      
+      const result = await query(bookingsQuery, queryParams);
+      
+      const bookings = result.rows.map((booking: DatabaseBooking) => ({
+        id: booking.id,
+        customerName: booking.customer_name,
+        customerEmail: booking.customer_email,
+        bookingDate: booking.booking_date, // Schon korrekt als Date-only
+        startTime: booking.start_time,
+        endTime: booking.end_time,
+        partySize: booking.party_size,
+        status: booking.status,
+        totalAmount: booking.total_amount ? parseFloat(booking.total_amount) : null,
+        service: {
+          name: booking.service_name,
+          durationMinutes: booking.duration_minutes
+        },
+        staffMember: booking.staff_name ? {
+          name: booking.staff_name
+        } : null
+      }));
+      
+      res.status(200).json({ bookings });
+      
+    } catch (error) {
+      console.error('Get bookings error:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
   }
-  
-  try {
-    // Manual WHERE clause building
-    let whereConditions = ['b.business_id = $1'];
-    let queryParams: any[] = [parseInt(businessId)];
-    let paramIndex = 2;
-    
-    if (date) {
-      whereConditions.push(`b.booking_date = $${paramIndex}`);
-      queryParams.push(date);
-      paramIndex++;
-    }
-    
-    if (status) {
-      whereConditions.push(`b.status = $${paramIndex}`);
-      queryParams.push(status);
-      paramIndex++;
-    }
-    
-    if (staffMemberId) {
-      whereConditions.push(`b.staff_member_id = $${paramIndex}`);
-      queryParams.push(parseInt(staffMemberId));
-      paramIndex++;
-    }
-    
-    // Manual complex JOIN query
-    const bookingsQuery = `
-      SELECT 
-        b.id, b.customer_name, b.customer_email, b.booking_date, 
-        b.start_time, b.end_time, b.party_size, b.status, b.total_amount,
-        s.name as service_name, s.duration_minutes,
-        sm.name as staff_name
-      FROM bookings b
-      JOIN services s ON b.service_id = s.id
-      LEFT JOIN staff_members sm ON b.staff_member_id = sm.id
-      WHERE ${whereConditions.join(' AND ')}
-      ORDER BY b.booking_date ASC, b.start_time ASC
-    `;
-    
-    const result = await query(bookingsQuery, queryParams);
-    
-    // Manual data transformation mit expliziten Typen
-    const bookings = result.rows.map((booking: DatabaseBooking) => ({
-      id: booking.id,
-      customerName: booking.customer_name,
-      customerEmail: booking.customer_email,
-      bookingDate: booking.booking_date,
-      startTime: booking.start_time,
-      endTime: booking.end_time,
-      partySize: booking.party_size,
-      status: booking.status,
-      totalAmount: booking.total_amount ? parseFloat(booking.total_amount) : null,
-      service: {
-        name: booking.service_name,
-        durationMinutes: booking.duration_minutes
-      },
-      staffMember: booking.staff_name ? {
-        name: booking.staff_name
-      } : null
-    }));
-    
-    res.status(200).json({ bookings });
-    
-  } catch (error) {
-    console.error('Get bookings error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-}
