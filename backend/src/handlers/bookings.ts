@@ -2,6 +2,9 @@ import { query, transaction } from '../utils/database';
 import { validateBookingData } from '../utils/validation';
 import { ExtendedRequest, ExtendedResponse } from '../types';
 
+// Import availability function
+import { calculateAvailableSlots } from './availability';
+
 // Explizite Database Types
 interface DatabaseBusiness {
   id: number;
@@ -77,7 +80,7 @@ export async function handleCreateBooking(req: ExtendedRequest, res: ExtendedRes
     
     // Manual service validation  
     const serviceResult = await query(
-      'SELECT id, duration_minutes, price, requires_staff, capacity FROM services WHERE id = $1 AND business_id = $2 AND is_active = true',
+      'SELECT id, duration_minutes, price, requires_staff, capacity, buffer_after_minutes FROM services WHERE id = $1 AND business_id = $2 AND is_active = true',
       [bookingData.serviceId, bookingData.businessId]
     );
     
@@ -107,6 +110,37 @@ export async function handleCreateBooking(req: ExtendedRequest, res: ExtendedRes
         return;
       }
     }
+
+    // AVAILABILITY CHECK
+    console.log('🔍 Checking availability for:', {
+        businessId: bookingData.businessId,
+        serviceId: bookingData.serviceId,
+        date: bookingData.bookingDate,
+        startTime: bookingData.startTime,
+        staffMemberId: bookingData.staffMemberId
+    });
+
+    const availableSlots = await calculateAvailableSlots({
+        businessId: bookingData.businessId,
+        serviceId: bookingData.serviceId,
+        date: bookingData.bookingDate,
+        staffMemberId: bookingData.staffMemberId
+      });
+  
+      const requestedSlot = availableSlots.find(slot => 
+        slot.start === bookingData.startTime && 
+        slot.available &&
+        (!bookingData.staffMemberId || slot.staffMemberId === bookingData.staffMemberId)
+      );
+  
+      if (!requestedSlot) {
+        console.log('❌ Requested slot not available:', bookingData.startTime);
+        console.log('Available slots:', availableSlots.filter(s => s.available).map(s => s.start));
+        res.status(400).json({ error: 'Requested time slot not available' });
+        return;
+      }
+  
+      console.log('✅ Slot is available, proceeding with booking');
     
     // Manual end time calculation
     const startTime = bookingData.startTime;

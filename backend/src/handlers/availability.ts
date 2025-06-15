@@ -69,7 +69,7 @@ export async function handleGetAvailability(req: ExtendedRequest, res: ExtendedR
 }
 
 // Manual availability calculation (was AvailabilityService in Express)
-async function calculateAvailableSlots(params: AvailabilityParams): Promise<TimeSlot[]> {
+export async function calculateAvailableSlots(params: AvailabilityParams): Promise<TimeSlot[]> {
   const { businessId, serviceId, date, staffMemberId } = params;
   
   // 1. Manual business validation
@@ -86,7 +86,7 @@ async function calculateAvailableSlots(params: AvailabilityParams): Promise<Time
   
   // 2. Manual service validation
   const serviceResult = await query(
-    `SELECT duration_minutes, capacity, requires_staff, buffer_before_minutes, buffer_after_minutes, is_active 
+    `SELECT duration_minutes, capacity, requires_staff, buffer_after_minutes, is_active 
      FROM services WHERE id = $1 AND business_id = $2`,
     [serviceId, businessId]
   );
@@ -171,92 +171,191 @@ async function getRestaurantSlots(businessId: number, service: any, date: string
 
 // Manual staff-based slots (salon, spa, etc.)
 async function getStaffBasedSlots(
-  businessId: number,
-  serviceId: number,
-  service: any,
-  date: string,
-  requestedStaffId?: number
-): Promise<TimeSlot[]> {
-  const dayOfWeek = getDayOfWeek(date);
+    businessId: number,
+    serviceId: number,
+    service: any,
+    date: string,
+    requestedStaffId?: number
+  ): Promise<TimeSlot[]> {
+    const dayOfWeek = getDayOfWeek(date);
   
-  // Manual staff members query
-  let staffQuery = `
-    SELECT DISTINCT sm.id, sm.name FROM staff_members sm
-    JOIN staff_services ss ON sm.id = ss.staff_member_id
-    WHERE sm.business_id = $1 AND ss.service_id = $2 AND sm.is_active = true
-  `;
+    // Available staff members for this service
+    let staffQuery = `
+      SELECT DISTINCT sm.id, sm.name FROM staff_members sm
+      JOIN staff_services ss ON sm.id = ss.staff_member_id
+      WHERE sm.business_id = $1 AND ss.service_id = $2 AND sm.is_active = true
+    `;
+    
+    let staffParams = [businessId, serviceId];
+    
+    if (requestedStaffId) {
+      staffQuery += ' AND sm.id = $3';
+      staffParams.push(requestedStaffId);
+    }
+    
+    const staffResult = await query(staffQuery, staffParams);
+    
+    if (staffResult.rows.length === 0) {
+      return [];
+    }
   
-  let staffParams = [businessId, serviceId];
+    const allSlots: TimeSlot[] = [];
   
-  if (requestedStaffId) {
-    staffQuery += ' AND sm.id = $3';
-    staffParams.push(requestedStaffId);
+    for (const staff of staffResult.rows) {
+      // Staff working hours
+      const staffHoursResult = await query(
+        `SELECT start_time, end_time FROM availability_rules 
+         WHERE staff_member_id = $1 AND day_of_week = $2 AND is_active = true`,
+        [staff.id, dayOfWeek]
+      );
+  
+      if (staffHoursResult.rows.length === 0) {
+        continue;
+      }
+  
+      // Staff special availability
+      const staffSpecialResult = await query(
+        `SELECT is_available, start_time, end_time FROM special_availability 
+         WHERE staff_member_id = $1 AND TO_CHAR(date, 'YYYY-MM-DD') = $2`,
+        [staff.id, date]
+      );
+  
+      if (staffSpecialResult.rows.length > 0 && !staffSpecialResult.rows[0].is_available) {
+        continue;
+      }
+  
+      // 🔧 NEW: Generate fixed 15-minute slots
+      for (const hours of staffHoursResult.rows) {
+        const startTime = staffSpecialResult.rows[0]?.start_time || hours.start_time;
+        const endTime = staffSpecialResult.rows[0]?.end_time || hours.end_time;
+        
+        const staffSlots = generateFixedTimeSlots(startTime, endTime, 15);
+  
+        const staffSlotsWithId = staffSlots.map(slot => ({
+          ...slot,
+          staffMemberId: staff.id
+        }));
+  
+        allSlots.push(...staffSlotsWithId);
+      }
+    }
+  
+    // 🔧 NEW: Filter by service duration and buffer
+    const availableSlots = await filterByServiceDurationAndBuffer(
+      allSlots,
+      businessId,
+      serviceId,
+      date,
+      service
+    );
+  
+    return availableSlots;
+  }
+
+// NEW: Generate fixed 15-minute time slots
+function generateFixedTimeSlots(
+    startTime: string,
+    endTime: string,
+    intervalMinutes: number = 15
+  ): TimeSlot[] {
+    const slots: TimeSlot[] = [];
+    
+    const startMinutes = timeToMinutes(startTime);
+    const endMinutes = timeToMinutes(endTime);
+    
+    let currentMinutes = startMinutes;
+    
+    while (currentMinutes < endMinutes) {
+      const slotStart = minutesToTime(currentMinutes);
+      const slotEnd = minutesToTime(currentMinutes + intervalMinutes);
+      
+      slots.push({
+        start: slotStart,
+        end: slotEnd,
+        available: true
+      });
+  
+      currentMinutes += intervalMinutes;
+    }
+  
+    return slots;
   }
   
-  const staffResult = await query(staffQuery, staffParams);
-  
-  if (staffResult.rows.length === 0) {
-    return []; // No available staff
-  }
-  
-  const allSlots: TimeSlot[] = [];
-  
-  // Manual loop through each staff member
-  for (const staff of staffResult.rows) {
-    // Manual staff working hours query
-    const staffHoursResult = await query(
-      `SELECT start_time, end_time FROM availability_rules 
-       WHERE staff_member_id = $1 AND day_of_week = $2 AND is_active = true`,
-      [staff.id, dayOfWeek]
+  // NEW: Filter slots by service duration and after-buffer only
+async function filterByServiceDurationAndBuffer(
+    slots: TimeSlot[],
+    businessId: number,
+    serviceId: number,
+    date: string,
+    service: any
+  ): Promise<TimeSlot[]> {
+    
+    const bookingsResult = await query(
+      `SELECT b.staff_member_id, b.start_time, b.end_time, 
+              s.duration_minutes, s.buffer_after_minutes
+       FROM bookings b
+       JOIN services s ON b.service_id = s.id
+       WHERE b.business_id = $1 AND TO_CHAR(b.booking_date, 'YYYY-MM-DD') = $2 
+       AND b.status IN ('confirmed', 'pending')`,
+      [businessId, date]
     );
     
-    if (staffHoursResult.rows.length === 0) {
-      continue; // Staff doesn't work this day
-    }
+    const existingBookings = bookingsResult.rows;
     
-    // Manual staff special availability
-    const staffSpecialResult = await query(
-      `SELECT is_available, start_time, end_time FROM special_availability 
-       WHERE staff_member_id = $1 AND date = $2`,
-      [staff.id, date]
-    );
+    console.log('🎯 SIMPLIFIED FILTERING:');
+    console.log(`   Service: ${service.duration_minutes}min + ${service.buffer_after_minutes || 0}min cleanup`);
+    console.log(`   Existing bookings: ${existingBookings.length}`);
     
-    if (staffSpecialResult.rows.length > 0 && !staffSpecialResult.rows[0].is_available) {
-      continue; // Staff not available
-    }
-    
-    // Manual slot generation for this staff
-    for (const hours of staffHoursResult.rows) {
-      const startTime = staffSpecialResult.rows[0]?.start_time || hours.start_time;
-      const endTime = staffSpecialResult.rows[0]?.end_time || hours.end_time;
+    return slots.filter(slot => {
+      if (!slot.staffMemberId) return false;
       
-      const totalDuration = service.duration_minutes + 
-                            (service.buffer_before_minutes || 0) + 
-                            (service.buffer_after_minutes || 0);
+      // Calculate when THIS service would end (including after-buffer)
+      const slotStartMinutes = timeToMinutes(slot.start);
+      const serviceEndMinutes = slotStartMinutes + service.duration_minutes + (service.buffer_after_minutes || 0);
+      const serviceEndTime = minutesToTime(serviceEndMinutes);
       
-      const staffSlots = generateTimeSlots(startTime, endTime, totalDuration, 15);
+      console.log(`🔍 Slot ${slot.start} → Service would end at ${serviceEndTime}`);
       
-      // Manual staff ID assignment
-      const staffSlotsWithId = staffSlots.map(slot => ({
-        ...slot,
-        staffMemberId: staff.id
-      }));
+      // Check against all existing bookings for this staff member
+      for (const booking of existingBookings) {
+        if (booking.staff_member_id === slot.staffMemberId) {
+          
+          // Existing booking blocks from start until end + its buffer
+          const bookingStart = booking.start_time;
+          const bookingEndMinutes = timeToMinutes(booking.end_time) + (booking.buffer_after_minutes || 0);
+          const bookingEnd = minutesToTime(bookingEndMinutes);
+          
+          console.log(`   vs existing: ${bookingStart}-${bookingEnd}`);
+          
+          // Check if OUR service overlaps with existing booking (including its buffer)
+          const conflict = timesOverlapExact(slot.start, serviceEndTime, bookingStart, bookingEnd);
+          
+          if (conflict) {
+            console.log(`   ❌ BLOCKED: Service ${slot.start}-${serviceEndTime} conflicts with ${bookingStart}-${bookingEnd}`);
+            return false;
+          }
+        }
+      }
       
-      allSlots.push(...staffSlotsWithId);
-    }
+      console.log(`   ✅ AVAILABLE`);
+      return true;
+    });
   }
-  
-  // Manual staff booking conflicts check
-  const availableSlots = await filterByStaffBookings(
-    allSlots,
-    businessId,
-    serviceId,
-    date,
-    service
-  );
-  
-  return availableSlots;
-}
+
+  // Exact overlap detection (no threshold)
+function timesOverlapExact(start1: string, end1: string, start2: string, end2: string): boolean {
+    const s1 = timeToMinutes(start1);
+    const e1 = timeToMinutes(end1);
+    const s2 = timeToMinutes(start2);
+    const e2 = timeToMinutes(end2);
+    
+    return s1 < e2 && s2 < e1;
+  }
+
+
+
+
+
 
 // Manual time slot generation (no date-fns library)
 function generateTimeSlots(
@@ -336,8 +435,7 @@ async function filterByStaffBookings(
   
   // Manual staff bookings query with service buffer times
   const bookingsResult = await query(
-    `SELECT b.staff_member_id, b.start_time, b.end_time, 
-            s.buffer_before_minutes, s.buffer_after_minutes
+    `SELECT b.staff_member_id, b.start_time, b.end_time, s.buffer_after_minutes
      FROM bookings b
      JOIN services s ON b.service_id = s.id
      WHERE b.business_id = $1 AND b.booking_date = $2 
@@ -346,6 +444,7 @@ async function filterByStaffBookings(
   );
   
   const existingBookings = bookingsResult.rows;
+  console.log('🔍 DEBUG - Existing bookings:', existingBookings);
   
   // Manual conflict detection
   return slots.filter(slot => {
@@ -363,9 +462,21 @@ async function filterByStaffBookings(
           booking.end_time, 
           booking.buffer_after_minutes || 0
         );
+
+        console.log(`🔍 BUFFER CALC:`);
+        console.log(`   Original: ${booking.start_time}-${booking.end_time}`);
+        console.log(`   Buffer: -${booking.buffer_before_minutes}min, +${booking.buffer_after_minutes}min`);
+        console.log(`   Result: ${bookingStart}-${bookingEnd}`);
         
-        if (timesOverlap(slot.start, slot.end, bookingStart, bookingEnd)) {
-          return false; // Conflict found
+        console.log(`🔍 DEBUG - Checking slot ${slot.start}-${slot.end} vs booking ${bookingStart}-${bookingEnd}`);
+        
+        const overlaps = timesOverlap(slot.start, slot.end, bookingStart, bookingEnd);
+        
+        console.log(`🔍 DEBUG - Overlap result: ${overlaps}`);
+        
+        if (overlaps) {
+          console.log(`❌ BLOCKED: Slot ${slot.start}-${slot.end} blocked by booking ${bookingStart}-${bookingEnd}`);
+          return false;
         }
       }
     }
@@ -376,9 +487,15 @@ async function filterByStaffBookings(
 
 // Manual utility functions (no external libraries)
 function timeToMinutes(timeString: string): number {
-  const [hours, minutes] = timeString.split(':').map(Number);
-  return hours * 60 + minutes;
-}
+    console.log(`🔍 Converting: "${timeString}"`);
+    const parts = timeString.split(':');
+    console.log(`🔍 Parts:`, parts);
+    const [hours, minutes] = parts.map(Number);
+    console.log(`🔍 Parsed: hours=${hours}, minutes=${minutes}`);
+    const result = hours * 60 + minutes;
+    console.log(`🔍 Result: ${hours}*60 + ${minutes} = ${result}`);
+    return result;
+  }
 
 function minutesToTime(totalMinutes: number): string {
   const hours = Math.floor(totalMinutes / 60);
@@ -392,18 +509,39 @@ function addMinutes(timeString: string, minutes: number): string {
 }
 
 function subtractMinutes(timeString: string, minutes: number): string {
-  const totalMinutes = timeToMinutes(timeString) - minutes;
-  return minutesToTime(Math.max(0, totalMinutes));
-}
+    console.log(`🔍 subtractMinutes("${timeString}", ${minutes})`);
+    const totalMinutes = timeToMinutes(timeString) - minutes;
+    console.log(`🔍 totalMinutes: ${totalMinutes}`);
+    const result = minutesToTime(Math.max(0, totalMinutes));
+    console.log(`🔍 result: "${result}"`);
+    return result;
+  }
 
-function timesOverlap(start1: string, end1: string, start2: string, end2: string): boolean {
-  const s1Minutes = timeToMinutes(start1);
-  const e1Minutes = timeToMinutes(end1);
-  const s2Minutes = timeToMinutes(start2);
-  const e2Minutes = timeToMinutes(end2);
-  
-  return s1Minutes < e2Minutes && s2Minutes < e1Minutes;
-}
+  function timesOverlap(start1: string, end1: string, start2: string, end2: string): boolean {
+    const s1Minutes = timeToMinutes(start1);
+    const e1Minutes = timeToMinutes(end1);
+    const s2Minutes = timeToMinutes(start2);
+    const e2Minutes = timeToMinutes(end2);
+    
+    // 🎯 REALISTISCHE LOGIC: Mindest-Overlap für Konflikt
+    const MINIMUM_CONFLICT_MINUTES = 10; // Nur >10min Overlap blockieren
+    
+    // Calculate actual overlap duration
+    const overlapStart = Math.max(s1Minutes, s2Minutes);
+    const overlapEnd = Math.min(e1Minutes, e2Minutes);
+    const overlapDuration = Math.max(0, overlapEnd - overlapStart);
+    
+    const hasSignificantOverlap = overlapDuration >= MINIMUM_CONFLICT_MINUTES;
+    
+    console.log(`🔍 SMART OVERLAP CHECK:`);
+    console.log(`   Slot:         ${start1}-${end1} (${s1Minutes}-${e1Minutes})`);
+    console.log(`   Booking+Buf:  ${start2}-${end2} (${s2Minutes}-${e2Minutes})`);
+    console.log(`   Overlap:      ${overlapStart}-${overlapEnd} = ${overlapDuration} minutes`);
+    console.log(`   Threshold:    ${MINIMUM_CONFLICT_MINUTES} minutes`);
+    console.log(`   Conflict:     ${hasSignificantOverlap ? '❌ YES (blocked)' : '✅ NO (allowed)'}`);
+    
+    return hasSignificantOverlap;
+  }
 
 function getDayOfWeek(dateString: string): number {
   // Manual day of week calculation (0 = Sunday, 1 = Monday, etc.)
